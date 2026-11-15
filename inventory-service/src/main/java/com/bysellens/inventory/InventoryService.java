@@ -1,0 +1,21 @@
+package com.bysellens.inventory;
+import java.util.*;import org.springframework.stereotype.Service;import org.springframework.transaction.annotation.Transactional;import com.bysellens.common.*;import com.fasterxml.jackson.databind.ObjectMapper;import com.fasterxml.jackson.core.type.TypeReference;
+@Service public class InventoryService {
+ private final StockRepository stocks;private final ReservaRepository reservas;private final MovimientoRepository movimientos;private final ObjectMapper mapper;
+ public InventoryService(StockRepository s,ReservaRepository r,MovimientoRepository m,ObjectMapper mapper){stocks=s;reservas=r;movimientos=m;this.mapper=mapper;}
+ public record View(long productoId,int stock,int stockMinimo,int reservado){}
+ public View view(Existencia e){return new View(e.productoId,e.stock-e.reservado,e.stockMinimo,e.reservado);}
+ public View get(long id){return view(stocks.findById(id).orElseThrow(DomainException::missing));}
+ public List<View> low(){return stocks.low().stream().map(this::view).toList();}
+ private Existencia lock(long id){return stocks.lock(id).orElseThrow(DomainException::missing);}
+ void movement(long id,int qty,String type,String ref){var m=new Movimiento();m.productoId=id;m.cantidad=qty;m.tipo=type;m.referencia=ref;movimientos.save(m);}
+ @Transactional public View initialize(long id,InventoryController.Init r){if(stocks.init(id,r.stock(),r.stockMinimo())==1)movement(id,r.stock(),"INICIAL","producto:"+id);var e=lock(id);e.stockMinimo=r.stockMinimo();return view(e);}
+ @Transactional public View adjust(long id,int value,Integer expected,boolean absolute){var e=lock(id);int available=e.stock-e.reservado;if(expected!=null&&available!=expected)throw new DomainException(409,"El stock cambio; recargue antes de ajustar");long next=absolute?(long)value+e.reservado:(long)e.stock+value;if(next<e.reservado||next>Integer.MAX_VALUE)throw new DomainException(409,"Stock insuficiente o cantidad fuera de rango");int delta=(int)next-e.stock;e.stock=(int)next;movement(id,delta,"AJUSTE",UUID.randomUUID().toString());return view(e);}
+ String json(Object value){try{return mapper.writeValueAsString(value);}catch(Exception e){throw new IllegalStateException(e);}}
+ List<InventoryController.Line> lines(Reserva r){try{return mapper.readValue(r.detalles,new TypeReference<List<InventoryController.Line>>(){});}catch(Exception e){throw new IllegalStateException(e);}}
+ @Transactional public Map<String,String> reserve(String id,List<InventoryController.Line> input){var sorted=input.stream().sorted(Comparator.comparing(InventoryController.Line::productoId)).toList();if(sorted.stream().map(InventoryController.Line::productoId).distinct().count()!=sorted.size())throw new DomainException(400,"Productos repetidos");String payload=json(sorted);reservas.init(id,payload);var r=reservas.lock(id).orElseThrow();if(!json(lines(r)).equals(payload))throw new DomainException(409,"Clave de reserva reutilizada con otros datos");if(r.estado.equals("CANCELADA"))throw new DomainException(409,"Reserva cancelada");if(!r.estado.equals("NUEVA"))return Map.of("estado",r.estado);
+ for(var line:sorted){var e=lock(line.productoId());if(e.stock-e.reservado<line.cantidad())throw new DomainException(409,"Stock insuficiente");e.reservado+=line.cantidad();movement(e.productoId,line.cantidad(),"RESERVA",id);}r.estado="RESERVADA";return Map.of("estado",r.estado);}
+ @Transactional public Map<String,String> transition(String id,boolean commit){var r=reservas.lock(id).orElseThrow(DomainException::missing);String target=commit?"CONFIRMADA":"CANCELADA";if(r.estado.equals(target))return Map.of("estado",target);if(!r.estado.equals("RESERVADA"))throw new DomainException(409,"Estado de reserva incompatible");for(var line:lines(r)){var e=lock(line.productoId());e.reservado-=line.cantidad();if(commit)e.stock-=line.cantidad();movement(e.productoId,commit?-line.cantidad():line.cantidad(),commit?"VENTA":"LIBERACION",id);}r.estado=target;return Map.of("estado",target);}
+ public Map<String,String> status(String id){return Map.of("estado",reservas.findById(id).orElseThrow(DomainException::missing).estado);}
+ public List<Movimiento> history(long id){get(id);return movimientos.findByProductoIdOrderByIdDesc(id);}
+}
